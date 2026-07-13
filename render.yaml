@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: ogunai-scout
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r backend/requirements.txt && pip install -r engine/requirements.engine.txt
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LLM_PROVIDER
+        value: openai_compatible
+      - key: OPENAI_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: OPENAI_MODEL
+        value: llama-3.3-70b-versatile
+      - key: OPENAI_API_KEY
+        sync: false # set manually in Render dashboard — never commit this
+      - key: SECRET_KEY
+        sync: false # set manually in Render dashboard
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: '60'
+      - key: MAX_ITERATIONS
+        value: '20'
+      - key: REQUEST_DELAY_SECONDS
+        value: '1.0'
+      - key: REPORTS_DIR
+        value: /tmp/reports
+      - key: MEMORY_FILE
+        value: /tmp/agent_memory.json
+
+databases:
+  - name: ogunai-db
+    databaseName: ogunai
+    user: ogunai
