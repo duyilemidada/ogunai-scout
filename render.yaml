@@ -15,9 +15,9 @@ services:
       - key: OPENAI_MODEL
         value: llama-3.3-70b-versatile
       - key: OPENAI_API_KEY
-        sync: false # set manually in Render dashboard — never commit this
+        sync: false # set in Render dashboard, never commit
       - key: SECRET_KEY
-        sync: false # set manually in Render dashboard
+        sync: false
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: '60'
       - key: MAX_ITERATIONS
@@ -28,8 +28,5 @@ services:
         value: /tmp/reports
       - key: MEMORY_FILE
         value: /tmp/agent_memory.json
-
-databases:
-  - name: ogunai-db
-    databaseName: ogunai
-    user: ogunai
+      - key: DATABASE_URL
+        value: 'sqlite:///./ogunai.db'
