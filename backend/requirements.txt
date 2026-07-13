@@ -1,0 +1,18 @@
+# backend/requirements.txt
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+sqlalchemy==2.0.36
+pydantic==2.9.0
+pydantic-settings==2.6.0
+python-jose[cryptography]==3.3.0
+bcrypt==4.0.1
+python-multipart==0.0.12
+httpx==0.27.0
+requests==2.32.3
+apscheduler==3.10.4
+websockets==13.1
+python-dotenv==1.0.1
+alembic==1.13.3
+openai==1.51.2
+dnspython==2.6.1
+pyyaml==6.0.2
