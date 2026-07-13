@@ -1,0 +1,22 @@
+# Virtual environments (any level)
+**/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables (never commit secrets)
+.env
+.env.local
+
+# Local database files
+*.db
+*.sqlite
+
+# IDE / OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
