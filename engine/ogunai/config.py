@@ -60,6 +60,21 @@ ENGINE_CONFIG: Dict[str, Any] = {
 
     # Business logic fuzzing
     "bl_fuzz_fields": os.getenv("BL_FUZZ_FIELDS", "amount,quantity,price,balance,limit"),
+
+    # ── RAG Configuration ────────────────────────────────────────────
+    # Set RAG_ENABLED=false to disable RAG without uninstalling packages
+    "rag_enabled": os.getenv("RAG_ENABLED", "true").lower() == "true",
+
+    # ChromaDB persist directory
+    # /tmp/chroma_db on Render (ephemeral per deploy, fine for portfolio)
+    # ./chroma_db locally (persists across restarts)
+    "chroma_dir": os.getenv(
+        "CHROMA_DIR",
+        "/tmp/chroma_db" if os.getenv("ENVIRONMENT") == "production" else "./chroma_db"
+    ),
+
+    # Number of similar past findings to surface per query domain
+    "rag_top_k": int(os.getenv("RAG_TOP_K", "2")),
 }
 
 

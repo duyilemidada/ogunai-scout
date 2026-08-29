@@ -64,6 +64,39 @@ def _get(url: str, timeout: int = 10, headers: dict = None) -> Optional[requests
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
         return None
 
+def _request(
+    url: str,
+    method: str = "GET",
+    body: Optional[Dict] = None,
+    extra_headers: Optional[Dict] = None,
+    timeout: int = 10
+) -> Optional[requests.Response]:
+    """
+    Make a request with any HTTP method.
+    Used by method-aware rate limit probing so we can POST/PUT with real bodies.
+    """
+    default_headers = {
+        "User-Agent": "OgunAI-Audit/3.0 (security assessment; contact@ogunai.io)",
+        "Content-Type": "application/json"
+    }
+    if extra_headers:
+        default_headers.update(extra_headers)
+
+    try:
+        kwargs = {
+            "headers": default_headers,
+            "timeout": timeout,
+            "allow_redirects": False,
+            "verify": True
+        }
+        if body and method.upper() in ("POST", "PUT", "PATCH"):
+            kwargs["json"] = body
+
+        return requests.request(method.upper(), url, **kwargs)
+    except requests.exceptions.SSLError as e:
+        return {"ssl_error": str(e), "url": url}
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL 1: Security Headers
@@ -565,30 +598,19 @@ def check_ssl_tls(base_url: str) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL 4: DNS and Email Security
 # ─────────────────────────────────────────────────────────────────────────────
-
 def check_dns_email_security(domain: str) -> Dict[str, Any]:
     """
     Check DNS records for email security configuration.
-    
-    SPF, DMARC, and DKIM are the three mechanisms that prevent attackers
-    from sending email that appears to come from your domain.
-    
-    Why this matters for fintechs:
-    - Without SPF: attacker sends "Your transaction failed, click here" from
-      payments@yourcompany.com and it passes basic spam filters
-    - Without DMARC: no policy exists to reject or quarantine fake emails
-    - Phishing from a legitimate-looking domain is the primary account takeover
-      vector for Nigerian fintech users
-    
-    Uses dnspython for DNS lookups. Install: pip install dnspython
-    
-    Args:
-        domain: Domain to check (e.g., "fraudshield.app", not "https://...")
-    
-    Returns:
-        Dict with SPF, DMARC, MX findings
+
+    CONTEXT-AWARE SEVERITY (Tier 1 improvement):
+    If the domain has no MX records, it is not configured to send or receive
+    email. SPF and DMARC are irrelevant for such domains — flagging them HIGH
+    produces false positives (as seen on Render subdomains like
+    fraudshield-xjgh.onrender.com). When MX is absent:
+    - All email security findings are downgraded to LOW
+    - A suppression_reason field explains why
+    - The agent is instructed to note this in its write_finding call
     """
-    
     try:
         import dns.resolver
     except ImportError:
@@ -596,14 +618,11 @@ def check_dns_email_security(domain: str) -> Dict[str, Any]:
             "error": "dnspython not installed. Run: pip install dnspython",
             "severity": "INFO"
         }
-    
+
     findings = []
     records_found = {}
-    
+
     # ── SPF Record ───────────────────────────────────────────────────
-    # SPF is a TXT record on the root domain that lists which servers
-    # are allowed to send email for that domain
-    # Format: "v=spf1 include:sendgrid.net ~all"
     try:
         txt_records = dns.resolver.resolve(domain, "TXT")
         spf_records = [
@@ -611,18 +630,17 @@ def check_dns_email_security(domain: str) -> Dict[str, Any]:
             for r in txt_records
             if "v=spf1" in r.to_text().lower()
         ]
-        
+
         if spf_records:
             spf = spf_records[0]
             records_found["spf"] = spf
-            
-            # Check ending: -all (strict) > ~all (soft fail) > ?all (neutral) > +all (pass all = bad)
+
             if "+all" in spf:
                 findings.append({
                     "issue": "SPF record allows all servers to send email (+all)",
                     "severity": "HIGH",
-                    "detail": f"SPF record ends with +all, meaning any server can send email claiming to be from {domain}.",
-                    "recommendation": "Change to -all (strict reject) or ~all (soft fail) at minimum.",
+                    "detail": f"SPF ends with +all — any server can send email as {domain}.",
+                    "recommendation": "Change to -all or ~all.",
                     "record": spf
                 })
             elif "?all" in spf:
@@ -640,11 +658,10 @@ def check_dns_email_security(domain: str) -> Dict[str, Any]:
                 "detail": f"No TXT record starting with 'v=spf1' found for {domain}.",
                 "recommendation": (
                     f"Add a TXT record for {domain}: "
-                    "'v=spf1 include:yourmailprovider.com -all'. "
-                    "Replace 'yourmailprovider.com' with your actual email provider (SendGrid, Gmail, Mailgun, etc.)."
+                    "'v=spf1 include:yourmailprovider.com -all'."
                 )
             })
-    
+
     except dns.resolver.NXDOMAIN:
         return {"error": f"Domain {domain} does not exist", "severity": "INFO"}
     except dns.resolver.NoAnswer:
@@ -656,29 +673,25 @@ def check_dns_email_security(domain: str) -> Dict[str, Any]:
         })
     except Exception as e:
         records_found["spf_error"] = str(e)
-    
+
     # ── DMARC Record ─────────────────────────────────────────────────
-    # DMARC is a TXT record at _dmarc.domain that tells receiving mail
-    # servers what to do with email that fails SPF/DKIM checks
-    # Format: "v=DMARC1; p=reject; rua=mailto:dmarc@yourdomain.com"
     try:
         dmarc_records = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
         dmarc = [r.to_text().strip('"') for r in dmarc_records]
-        
+
         if dmarc:
             dmarc_record = dmarc[0]
             records_found["dmarc"] = dmarc_record
-            
-            # Parse the policy
+
             policy_match = re.search(r"p=(\w+)", dmarc_record)
             policy = policy_match.group(1) if policy_match else "none"
-            
+
             if policy == "none":
                 findings.append({
-                    "issue": "DMARC policy is set to 'none' — no enforcement",
+                    "issue": "DMARC policy is 'none' — no enforcement",
                     "severity": "MEDIUM",
-                    "detail": "p=none means DMARC is in monitoring mode only. Spoofed emails are not blocked.",
-                    "recommendation": "Change p=none to p=quarantine (spam folder) or p=reject (block entirely).",
+                    "detail": "p=none means DMARC monitoring only. Spoofed emails are not blocked.",
+                    "recommendation": "Change p=none to p=quarantine or p=reject.",
                     "record": dmarc_record
                 })
         else:
@@ -691,7 +704,7 @@ def check_dns_email_security(domain: str) -> Dict[str, Any]:
                     "'v=DMARC1; p=reject; rua=mailto:dmarc@yourdomain.com'"
                 )
             })
-    
+
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
         findings.append({
             "issue": "No DMARC record found",
@@ -704,29 +717,213 @@ def check_dns_email_security(domain: str) -> Dict[str, Any]:
         })
     except Exception as e:
         records_found["dmarc_error"] = str(e)
-    
+
     # ── MX Records ───────────────────────────────────────────────────
-    # Just check that email delivery is configured at all
     try:
         mx_records = dns.resolver.resolve(domain, "MX")
         records_found["mx"] = [r.to_text() for r in mx_records]
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
         records_found["mx"] = []
-    
+    except Exception:
+        records_found["mx"] = []
+
+    # ── CONTEXT-AWARE SEVERITY SUPPRESSION ───────────────────────────
+    # If no MX records exist, this domain is not configured to send email.
+    # SPF/DMARC findings are not applicable — downgrade all to LOW and
+    # add a suppression_reason so the agent can report this accurately
+    # instead of writing misleading HIGH findings.
+    has_mx = bool(records_found.get("mx"))
+
+    if not has_mx:
+        suppression_reason = (
+            f"Domain '{domain}' has no MX records and does not appear to send "
+            f"or receive email. SPF and DMARC are only required for domains that "
+            f"send email. This is common for API subdomains hosted on platforms "
+            f"like Render, Railway, or Fly.io. If this domain DOES send email via "
+            f"a third-party provider (SendGrid, Mailgun etc.), MX records should "
+            f"be added and this finding re-evaluated."
+        )
+        for finding in findings:
+            if finding.get("severity") in ("HIGH", "MEDIUM"):
+                finding["original_severity"] = finding["severity"]
+                finding["severity"] = "LOW"
+                finding["suppression_reason"] = suppression_reason
+
     severity_levels = [f["severity"] for f in findings]
-    overall = ("HIGH" if "HIGH" in severity_levels
-               else "MEDIUM" if "MEDIUM" in severity_levels
-               else "LOW" if findings
-               else "PASS")
-    
+    overall = (
+        "HIGH" if "HIGH" in severity_levels
+        else "MEDIUM" if "MEDIUM" in severity_levels
+        else "LOW" if severity_levels
+        else "PASS"
+    )
+
     return {
         "domain": domain,
+        "has_mx_records": has_mx,
         "records_found": records_found,
         "findings": findings,
         "overall_severity": overall,
-        "summary": f"SPF: {'✓' if 'spf' in records_found else '✗'} | DMARC: {'✓' if 'dmarc' in records_found else '✗'} | MX: {'✓' if records_found.get('mx') else '✗'}"
+        "severity_suppressed": not has_mx,
+        "summary": (
+            f"SPF: {'✓' if 'spf' in records_found else '✗'} | "
+            f"DMARC: {'✓' if 'dmarc' in records_found else '✗'} | "
+            f"MX: {'✓' if has_mx else '✗ (no email configured)'}"
+        )
     }
 
+
+def fetch_openapi_schema(base_url: str) -> Dict[str, Any]:
+    """
+    Fetch and parse the OpenAPI/Swagger schema from common discovery paths.
+
+    This is the Tier 1/3 improvement that makes Scout schema-aware.
+    Instead of guessing at endpoints and HTTP methods, the agent can read
+    the schema and know exactly what each endpoint requires before probing it.
+
+    This directly enables method-aware rate limit probing:
+    - Without schema: sends GET to all endpoints (misses POST-only routes)
+    - With schema: sends POST with correct body to /predict, GET to /health, etc.
+
+    The schema exposure itself may be a finding — /openapi.json publicly
+    accessible gives attackers a complete map of your API. The agent decides
+    whether to write that finding based on context (dev vs prod, sensitivity).
+
+    Returns:
+        Dict with endpoint list, methods, auth requirements, and schema URL.
+        endpoints is a list of {path, method, summary, requires_auth, request_body}
+    """
+    schema_paths = [
+        "/openapi.json",
+        "/openapi.yaml",
+        "/swagger.json",
+        "/swagger.yaml",
+        "/api-docs",
+        "/api/v1/openapi.json",
+        "/api/docs/openapi.json",
+        "/v1/openapi.json",
+    ]
+
+    for path in schema_paths:
+        url = base_url.rstrip("/") + path
+        resp = _get(url, timeout=10)
+
+        if not resp or isinstance(resp, dict) or resp.status_code != 200:
+            continue
+
+        try:
+            if path.endswith((".yaml", ".yml")):
+                try:
+                    import yaml
+                    schema = yaml.safe_load(resp.text)
+                except ImportError:
+                    # Try JSON parse as fallback
+                    schema = resp.json()
+            else:
+                schema = resp.json()
+
+            if not isinstance(schema, dict):
+                continue
+
+            # Validate it looks like OpenAPI
+            if not any(k in schema for k in ("paths", "openapi", "swagger", "info")):
+                continue
+
+            # Extract structured endpoint information
+            endpoints = []
+            paths_obj = schema.get("paths", {})
+            global_security = bool(schema.get("security"))
+
+            for endpoint_path, methods_obj in paths_obj.items():
+                if not isinstance(methods_obj, dict):
+                    continue
+                for method, details in methods_obj.items():
+                    if method.lower() not in ("get", "post", "put", "patch", "delete", "options"):
+                        continue
+                    if not isinstance(details, dict):
+                        continue
+
+                    # Determine auth requirement
+                    endpoint_security = details.get("security")
+                    requires_auth = bool(
+                        global_security or
+                        (endpoint_security is not None and endpoint_security != [])
+                    )
+
+                    # Extract request body schema for POST/PUT/PATCH probing
+                    body_schema = None
+                    request_body = details.get("requestBody", {})
+                    if request_body:
+                        content = request_body.get("content", {})
+                        json_schema = content.get("application/json", {}).get("schema", {})
+                        if json_schema:
+                            # Build a minimal example body from required fields
+                            required = json_schema.get("required", [])
+                            props = json_schema.get("properties", {})
+                            body_schema = {
+                                "required_fields": required,
+                                "properties": {
+                                    k: v.get("type", "string")
+                                    for k, v in props.items()
+                                    if k in required
+                                } if required else {}
+                            }
+
+                    endpoints.append({
+                        "path": endpoint_path,
+                        "method": method.upper(),
+                        "summary": details.get("summary", ""),
+                        "requires_auth": requires_auth,
+                        "has_request_body": bool(request_body),
+                        "body_schema": body_schema,
+                        "tags": details.get("tags", []),
+                    })
+
+            # Sort: most important endpoints first
+            # PUT auth/predict-style endpoints at top
+            def endpoint_priority(ep):
+                path_lower = ep["path"].lower()
+                if any(w in path_lower for w in ("predict", "transaction", "auth", "login")):
+                    return 0
+                if any(w in path_lower for w in ("upload", "payment", "transfer")):
+                    return 1
+                return 2
+
+            endpoints.sort(key=endpoint_priority)
+
+            return {
+                "schema_found": True,
+                "schema_url": url,
+                "api_title": schema.get("info", {}).get("title", "Unknown"),
+                "api_version": schema.get("info", {}).get("version", ""),
+                "openapi_version": schema.get("openapi") or schema.get("swagger", ""),
+                "endpoint_count": len(endpoints),
+                "endpoints": endpoints[:40],  # Cap at 40 — beyond this the context bloats
+                "severity": "INFO",
+                "note": (
+                    f"Schema found at {url}. "
+                    f"Agent should use endpoint method/body info for accurate probing. "
+                    f"Public schema exposure may be a finding if this is production."
+                )
+            }
+
+        except Exception as e:
+            # This path didn't parse — try next
+            continue
+
+    # Nothing found
+    return {
+        "schema_found": False,
+        "schema_url": None,
+        "endpoints": [],
+        "endpoint_count": 0,
+        "severity": "INFO",
+        "note": (
+            "No OpenAPI schema found at common paths. "
+            "Agent will use generic endpoint probing. "
+            "If the target has API docs at a non-standard path, "
+            "check manually and add to the client profile."
+        )
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL 5: CORS Policy Check
@@ -849,81 +1046,178 @@ def check_cors_policy(base_url: str, api_endpoints: List[str] = None) -> Dict[st
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL 6: Rate Limiting Detection
 # ─────────────────────────────────────────────────────────────────────────────
-
-def check_rate_limiting(base_url: str, endpoint: str = "/api/v1/predict") -> Dict[str, Any]:
+def check_rate_limiting(
+    base_url: str,
+    endpoint: str = "/api/v1/predict",
+    method: str = "GET",
+    body: Optional[Dict] = None,
+    auth_header: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Check if the API enforces rate limiting.
-    
-    We send 15 requests in quick succession and check if a 429 (Too Many Requests)
-    response appears. This is NOT a brute force attack — 15 requests is enough
-    to trigger any reasonable rate limiter without causing harm.
-    
-    Why this matters: without rate limiting on prediction/transaction endpoints:
-    - Threshold probing becomes trivial (attacker can send thousands of requests)
-    - Credential stuffing is unrestricted if the endpoint involves auth
-    - Competitor could scrape your ML model's responses at no cost
-    
+    Check if the API enforces rate limiting on a specific endpoint.
+
+    METHOD-AWARE (Tier 1/2 improvement):
+    The original implementation sent GET requests to all endpoints.
+    This missed rate limiters on POST-only routes because the server
+    returns 405 Method Not Allowed — the limiter never activates.
+
+    This version accepts the correct HTTP method and body. The agent
+    should call fetch_openapi_schema first, then pass the correct method:
+
+        check_rate_limiting(
+            base_url="https://api.example.com",
+            endpoint="/api/v1/predict",
+            method="POST",
+            body={"amount": 100, "customer_id": "test"}
+        )
+
+    If the endpoint requires auth (requires_auth=True in schema), the agent
+    should note that in the finding: rate limit detection is approximate
+    because unauthenticated requests are rejected before hitting the limiter.
+
     Args:
         base_url: Root URL
-        endpoint: Endpoint to check (default: predict endpoint)
-    
+        endpoint: Endpoint path to probe
+        method: HTTP method (GET, POST, PUT, etc.) — use schema info
+        body: Request body for POST/PUT/PATCH (use minimal valid body)
+        auth_header: Optional Authorization header value for authenticated probing
+
     Returns:
-        Dict with rate limit detection result
+        Dict with rate limit detection result, including method used and
+        a confidence note if probing was unauthenticated on an auth-required route.
     """
-    
     url = base_url.rstrip("/") + endpoint
     responses = []
-    
+
+    extra_headers = {}
+    if auth_header:
+        extra_headers["Authorization"] = auth_header
+
+    # First probe: OPTIONS to discover what the endpoint actually accepts
+    # This helps detect 405 responses before we waste 15 requests
+    options_resp = _request(url, method="OPTIONS", timeout=8)
+    allowed_methods = []
+    if options_resp and not isinstance(options_resp, dict):
+        allow_header = options_resp.headers.get("Allow", "")
+        if allow_header:
+            allowed_methods = [m.strip().upper() for m in allow_header.split(",")]
+
+    # If caller specified GET but server only allows POST, note this
+    method_mismatch = (
+        allowed_methods and
+        method.upper() not in allowed_methods and
+        method.upper() != "GET"  # GET mismatches are less concerning
+    )
+
     for i in range(15):
-        resp = _get(url)
-        
+        resp = _request(
+            url,
+            method=method,
+            body=body,
+            extra_headers=extra_headers,
+            timeout=8
+        )
+
         if resp is None or isinstance(resp, dict):
-            # If we get SSL error or connection failure, stop
             break
-        
-        responses.append({
+
+        resp_data = {
             "attempt": i + 1,
             "status_code": resp.status_code,
             "has_rate_limit_headers": (
                 "x-ratelimit-remaining" in resp.headers or
                 "retry-after" in resp.headers or
-                "x-rate-limit" in resp.headers
+                "x-rate-limit" in resp.headers or
+                "ratelimit-limit" in resp.headers
             )
-        })
-        
+        }
+        responses.append(resp_data)
+
         if resp.status_code == 429:
-            # Rate limiting kicked in — this is correct behaviour
+            # Rate limiting kicked in — correct behaviour
             break
-        
-        # Small delay between requests — we're probing, not attacking
+
         time.sleep(0.3)
-    
+
+    if not responses:
+        return {
+            "endpoint": endpoint,
+            "method_used": method,
+            "requests_sent": 0,
+            "rate_limited": False,
+            "severity": "INFO",
+            "detail": "Endpoint did not respond to any probe requests.",
+            "recommendation": "Verify the endpoint is reachable and the URL is correct."
+        }
+
     status_codes = [r["status_code"] for r in responses]
     rate_limited = 429 in status_codes
     has_rl_headers = any(r["has_rate_limit_headers"] for r in responses)
-    
+
+    # Detect if all responses are auth errors (403/401/405) — probe was invalid
+    auth_blocked = all(s in (401, 403) for s in status_codes)
+    method_blocked = all(s == 405 for s in status_codes)
+
+    # Build confidence note
+    confidence_note = None
+    if method_blocked:
+        confidence_note = (
+            f"All {len(responses)} requests returned 405 Method Not Allowed. "
+            f"The endpoint may only accept {allowed_methods or 'a different method'}. "
+            f"Rate limit detection is unreliable — use the correct HTTP method from the schema."
+        )
+    elif auth_blocked:
+        confidence_note = (
+            f"All {len(responses)} requests returned 401/403. "
+            f"This endpoint requires authentication. "
+            f"Rate limit detection is unreliable without valid credentials — "
+            f"the auth check fires before the rate limiter."
+        )
+    elif method_mismatch:
+        confidence_note = (
+            f"Probed with {method} but server allows: {', '.join(allowed_methods)}. "
+            f"Rate limit result may be inaccurate."
+        )
+
     if rate_limited:
         severity = "PASS"
         detail = f"Rate limiting detected at attempt {status_codes.index(429) + 1}."
         recommendation = "Rate limiting is active."
     elif has_rl_headers:
         severity = "PASS"
-        detail = "Rate limit headers present indicating rate limiting is configured."
-        recommendation = "Rate limiting appears configured via headers."
+        detail = "Rate limit headers present — rate limiting is configured."
+        recommendation = "Rate limiting appears configured."
+    elif method_blocked or auth_blocked:
+        # Can't conclude rate limiting is absent if we never reached the endpoint logic
+        severity = "INFO"
+        detail = confidence_note or "Rate limit could not be assessed due to method/auth block."
+        recommendation = (
+            "Re-test with the correct HTTP method and a valid authentication token "
+            "to get an accurate rate limit assessment."
+        )
     else:
         severity = "HIGH"
-        detail = f"Sent {len(responses)} requests without triggering rate limiting."
+        detail = (
+            f"Sent {len(responses)} {method} requests to {endpoint} "
+            f"without triggering rate limiting."
+        )
         recommendation = (
             "Implement rate limiting on this endpoint. "
             "For FastAPI: use slowapi. For Express: use express-rate-limit. "
-            "Recommended: max 20 requests per minute per API key on prediction endpoints."
+            "Recommended: max 20 requests per minute per API key on sensitive endpoints."
         )
-    
+
     return {
         "endpoint": endpoint,
+        "method_used": method,
+        "allowed_methods": allowed_methods,
         "requests_sent": len(responses),
         "rate_limited": rate_limited,
         "has_rate_limit_headers": has_rl_headers,
+        "status_codes_seen": list(set(status_codes)),
+        "auth_blocked": auth_blocked,
+        "method_blocked": method_blocked,
+        "confidence_note": confidence_note,
         "responses": responses,
         "severity": severity,
         "detail": detail,
@@ -1244,30 +1538,43 @@ def write_finding(
     evidence: Dict[str, Any],
     recommendation: str,
     endpoint: str = "",
-    compliance_refs: List[str] = None
+    compliance_refs: List[str] = None,
+    confidence: str = "medium",
 ) -> Dict[str, Any]:
     """
     Record a confirmed finding from the audit.
-    
-    Same interface as v3 write_finding, with the addition of compliance_refs
-    for mapping to CBN/NDPR requirements automatically.
-    
-    Args:
-        attack_family: Category (HEADER_SECURITY, SSL_TLS, DNS_EMAIL, etc.)
-        severity: CRITICAL, HIGH, MEDIUM, LOW
-        title: Short descriptive title
-        description: Plain English explanation
-        evidence: Dict with supporting data
-        recommendation: Specific fix
-        endpoint: Affected URL path if applicable
-        compliance_refs: List of compliance framework references (auto-mapped if empty)
-    
-    Returns:
-        The finding dict
+
+    CONFIDENCE FIELD (Tier 1/4 improvement):
+    Adds an honest signal about how certain the finding is.
+    This prevents over-reporting and builds client trust.
+
+    confidence values:
+    - "high":   Direct evidence in server response (e.g., header is actually missing,
+                credential keyword found in body, wildcard CORS confirmed in response).
+                Use when the finding is definitively confirmed by the tool output.
+
+    - "medium": Strong indicator but not 100% confirmed. Default for most findings.
+                Use when the tool result clearly suggests an issue but indirect evidence.
+                Example: rate limiter not triggered in unauthenticated probe (may be
+                auth-gated, not absent).
+
+    - "low":    Possible issue but significant uncertainty. Use when:
+                - Rate limiting probe was blocked by auth/method mismatch
+                - SPF/DMARC finding on a domain with no MX (already suppressed but
+                  still worth noting the uncertainty)
+                - Sensitive path returns 403 (exists but blocked — may be intentional)
+                - Any finding where the evidence is circumstantial
+
+    The confidence field appears in the report and helps developers prioritise:
+    high-confidence findings get fixed immediately, low-confidence findings
+    get investigated before remediation.
     """
-    
-    # Auto-map to compliance frameworks based on attack family
-    # This saves the agent from needing to know the compliance details
+    # Validate confidence value
+    valid_confidences = ("high", "medium", "low")
+    if confidence not in valid_confidences:
+        confidence = "medium"
+
+    # Auto-map compliance references based on attack family
     COMPLIANCE_MAPPING = {
         "HEADER_SECURITY": [
             "CBN Cybersecurity Framework — Application Security (AS-3)",
@@ -1285,15 +1592,27 @@ def write_finding(
             "OWASP Top 10 — A05: Security Misconfiguration"
         ],
         "DNS_EMAIL": [
-            "CBN Cybersecurity Framework — Identity & Access Management (IAM-2)",
+            "CBN Cybersecurity Framework — Identity & Access Management (IAM2)",
             "NDPR Article 24 — Protection against unauthorised access",
             "ISO 27001 A.13.2.3 — Electronic messaging"
+        ],
+        "EMAIL_SPOOFING": [
+            "CBN Cybersecurity Framework — Identity & Access Management (IAM2)",
+            "NDPR Article 24 — Protection against unauthorised access",
         ],
         "CORS": [
             "CBN Cybersecurity Framework — Application Security (AS-4)",
             "NDPR Article 24 — Technical measures for data protection"
         ],
         "RATE_LIMIT": [
+            "CBN Cybersecurity Framework — Application Security (AS-5)",
+            "NDPR Article 24 — Ensuring availability of processing"
+        ],
+        "BRUTE_FORCE": [
+            "CBN Cybersecurity Framework — Application Security (AS-5)",
+            "NDPR Article 24 — Ensuring availability of processing"
+        ],
+        "DENIAL_OF_SERVICE": [
             "CBN Cybersecurity Framework — Application Security (AS-5)",
             "NDPR Article 24 — Ensuring availability of processing"
         ],
@@ -1308,13 +1627,16 @@ def write_finding(
             "OWASP Top 10 — A05: Security Misconfiguration"
         ],
     }
-    
-    auto_refs = COMPLIANCE_MAPPING.get(attack_family.upper(), [])
+
+    # Normalise family key for lookup (handles "Email Spoofing" → "EMAIL_SPOOFING")
+    family_key = attack_family.upper().replace(" ", "_")
+    auto_refs = COMPLIANCE_MAPPING.get(family_key, [])
     final_refs = compliance_refs or auto_refs
-    
+
     finding = {
         "attack_family": attack_family,
         "severity": severity,
+        "confidence": confidence,
         "title": title,
         "description": description,
         "evidence": evidence,
@@ -1323,10 +1645,9 @@ def write_finding(
         "compliance_references": final_refs,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
-    
-    print(f"[FINDING] {severity}: {title}")
-    return finding
 
+    print(f"[FINDING] {severity} [{confidence} confidence]: {title}")
+    return finding
 
 def audit_orm_safety(code_snippet: str) -> Dict[str, Any]:
     """

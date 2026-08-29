@@ -37,6 +37,7 @@ from .tools_passive import (
     check_information_disclosure,
     scan_dependencies,
     write_finding,
+    audit_orm_safety, fetch_openapi_schema
 )
 
 
@@ -93,7 +94,7 @@ class OgunAIAgent:
     The same LLM reads the passive tool results and writes findings.
     Simple, debuggable, works on your hardware.
     """
-    
+
     def __init__(self, profile: Dict[str, Any], llm: Optional[BaseLLMAdapter] = None):
         self.profile = profile.copy()
         self.llm = llm or get_default_adapter()
@@ -109,37 +110,59 @@ class OgunAIAgent:
 
         self.max_iterations = get_config("max_iterations", 20)
 
-        # Load memory from previous sessions
+        # Load JSON memory from previous sessions
         self.memory = load_memory()
         client_name = profile.get("client_name", "unknown")
         memory_context = memory_to_context(self.memory, client_name)
         if memory_context:
             self.profile["_memory_context"] = memory_context
 
+        # ── RAG: semantic context from past findings across all clients ──
+        # Runs only if chromadb + sentence-transformers are installed
+        # Silently skips if unavailable — no impact on agent behaviour
+        if get_config("rag_enabled", True):
+            try:
+                from .memory_rag import get_rag_context
+                rag_context = get_rag_context(
+                    client_name=client_name,
+                    target_type=profile.get("target_type", "full_spectrum")
+                )
+                if rag_context:
+                    self.profile["_rag_context"] = rag_context
+            except Exception as e:
+                print(f"[RAG] Context retrieval failed (non-fatal): {e}")
+        # ────────────────────────────────────────────────────────────────
+
         print(f"[AGENT] Initialized — LLM: {self.llm.get_model_info()['model']}")
         print(f"[AGENT] Tools: {list_tools()}")
-
+    
     def _build_messages(self, iteration_prompt: str) -> List[Dict[str, str]]:
-        """
-        Build the full message list for the LLM:
-        1. System prompt (permanent instructions + memory context)
-        2. Conversation history (all previous iterations)
-        3. Current iteration prompt (what to do now)
-        """
         messages = [{"role": "system", "content": self.system_prompt}]
 
+        # JSON memory: known findings from previous sessions for this client
         memory_context = self.profile.get("_memory_context")
         if memory_context:
             messages.append({
                 "role": "system",
                 "content": f"MEMORY FROM PREVIOUS AUDITS:\n{memory_context}\n\n"
-                           f"Use this to avoid re-testing confirmed findings."
+                        f"Use this to avoid re-testing confirmed findings."
+            })
+
+        # RAG context: semantically similar findings from ALL past audits
+        # Gives cross-client learning — patterns seen in other systems
+        rag_context = self.profile.get("_rag_context")
+        if rag_context:
+            messages.append({
+                "role": "system",
+                "content": f"RAG CONTEXT — SIMILAR FINDINGS FROM OTHER AUDITED SYSTEMS:\n"
+                        f"{rag_context}\n\n"
+                        f"Use this as a starting hypothesis — these patterns appear "
+                        f"frequently in similar systems. Check if they apply here."
             })
 
         messages.extend(self.history)
         messages.append({"role": "user", "content": iteration_prompt})
         return messages
-
     def step(self) -> bool:
         """
         One iteration of the ReAct loop.
@@ -262,6 +285,14 @@ class OgunAIAgent:
         # Update memory
         record_session(self.memory, client_name, self.findings)
 
+        # Store findings in RAG vector store for future cross-client learning
+        if self.findings and get_config("rag_enabled", True):
+            try:
+                from .memory_rag import store_findings
+                store_findings(self.findings, client_name=client_name)
+            except Exception as e:
+                print(f"[RAG] Could not store findings (non-fatal): {e}")
+
         print(f"\n{'=' * 60}")
         print(f"AUDIT COMPLETE")
         print(f"Duration:   {elapsed:.0f}s ({elapsed / 60:.1f} min)")
@@ -295,4 +326,5 @@ register_tool("check_rate_limiting", check_rate_limiting)
 register_tool("check_information_disclosure", check_information_disclosure)
 register_tool("scan_dependencies", scan_dependencies)
 register_tool("write_finding", write_finding)
-
+register_tool("fetch_openapi_schema", fetch_openapi_schema)
+register_tool("audit_orm_safety", audit_orm_safety)
