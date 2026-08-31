@@ -19,3 +19,5 @@ pyjwt==2.8.0
 scikit-learn==1.5.1
 numpy==1.26.4
 filelock==3.16.1
+chromadb==0.5.15
+sentence-transformers==3.2.0

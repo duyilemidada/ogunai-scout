@@ -8,7 +8,6 @@ scikit-learn==1.5.1
 numpy==1.26.4
 filelock==3.16.1
 
-chromadb==0.5.15
 sentence-transformers==3.2.0
 # Optional:
 # anthropic==0.34.0
