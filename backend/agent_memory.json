@@ -1,17 +1,21 @@
 {
-  "sessions_run": 4,
-  "total_findings": 3,
+  "sessions_run": 7,
+  "total_findings": 5,
   "clients": {
     "FraudShield": {
-      "sessions_run": 5,
+      "sessions_run": 8,
       "known_findings": [
         "Email Spoofing (HIGH): No SPF Record Found",
         "Email Spoofing (HIGH): No DMARC Record Found",
-        "Denial of Service (HIGH): Inadequate Rate Limiting"
+        "Denial of Service (HIGH): Inadequate Rate Limiting",
+        "Transport Security (HIGH): Missing HTTP Strict Transport Security (HSTS) Header",
+        "Content Security (MEDIUM): Missing Content Security Policy (CSP) Header"
       ],
       "effective_checks": [
         "Email Spoofing",
-        "Denial of Service"
+        "Denial of Service",
+        "Transport Security",
+        "Content Security"
       ]
     }
   }

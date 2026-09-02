@@ -1,7 +1,6 @@
 # engine/ogunai/memory_rag.py
 """
 Lightweight RAG using sentence-transformers + numpy.
-
 No ChromaDB. No compilation. No servers.
 Embeddings stored in a JSON file alongside the existing agent_memory.json.
 Retrieval via cosine similarity with numpy.
