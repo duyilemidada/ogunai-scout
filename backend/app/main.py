@@ -49,47 +49,51 @@ async def lifespan(app: FastAPI):
 
     # Rebuild RAG vector store from existing findings in SQLite
     # Handles Render redeploys where /tmp/chroma_db was wiped
-    try:
-        from .database import SessionLocal
-        from .models import Finding, Client
-        import sys
-        from pathlib import Path
-        PROJECT_ROOT = Path(__file__).resolve().parents[2]
-        if str(PROJECT_ROOT) not in sys.path:
-            sys.path.insert(0, str(PROJECT_ROOT))
-
-        from engine.ogunai.memory_rag import rebuild_from_session_data
-
-        db = SessionLocal()
+    # AFTER — only imports when RAG is actually enabled
+    import os as _os
+    if _os.getenv("RAG_ENABLED", "true").lower() == "true":
         try:
-            # Load all findings grouped by client from the DB
-            clients = db.query(Client).filter(Client.is_active == True).all()
-            sessions_data = []
-            for client in clients:
-                findings = db.query(Finding).filter(
-                    Finding.client_id == client.id
-                ).all()
-                if findings:
-                    sessions_data.append({
-                        "client_name": client.name,
-                        "findings": [
-                            {
-                                "attack_family": f.attack_family,
-                                "severity": f.severity,
-                                "title": f.title,
-                                "description": f.description,
-                                "recommendation": f.recommendation,
-                                "endpoint": f.endpoint or "",
-                            }
-                            for f in findings
-                        ]
-                    })
-            if sessions_data:
-                rebuild_from_session_data(sessions_data)
-        finally:
-            db.close()
-    except Exception as e:
-        print(f"[RAG] Startup rebuild skipped: {e}")
+            from .database import SessionLocal
+            from .models import Finding, Client
+            import sys
+            from pathlib import Path
+            PROJECT_ROOT = Path(__file__).resolve().parents[2]
+            if str(PROJECT_ROOT) not in sys.path:
+                sys.path.insert(0, str(PROJECT_ROOT))
+
+            from engine.ogunai.memory_rag import rebuild_from_session_data
+
+            db = SessionLocal()
+            try:
+                clients = db.query(Client).filter(Client.is_active == True).all()
+                sessions_data = []
+                for client in clients:
+                    findings = db.query(Finding).filter(
+                        Finding.client_id == client.id
+                    ).all()
+                    if findings:
+                        sessions_data.append({
+                            "client_name": client.name,
+                            "findings": [
+                                {
+                                    "attack_family": f.attack_family,
+                                    "severity": f.severity,
+                                    "title": f.title,
+                                    "description": f.description,
+                                    "recommendation": f.recommendation,
+                                    "endpoint": f.endpoint or "",
+                                }
+                                for f in findings
+                            ]
+                        })
+                if sessions_data:
+                    rebuild_from_session_data(sessions_data)
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"[RAG] Startup rebuild skipped: {e}")
+    else:
+        print("[RAG] Disabled via RAG_ENABLED=false — skipping startup rebuild")
 
     # FIX ORPHANED SESSIONS (Crash recovery)
     from .database import SessionLocal
